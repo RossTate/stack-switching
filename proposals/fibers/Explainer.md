@@ -200,31 +200,25 @@ Note that it does not trigger any unwinding of the given fiber, as that would re
 
 ## Utility Instructions
 
-#### `fiber.spawn` Create and enter a new fiber
+#### `fiber.mount_new`/`fiber.switch_new` Create and execute a new fiber
 
-The `fiber.spawn` instruction creates a new fiber and immediately enters it. It requires a literal function operand of type `[[fiber r*] t*] -> [r*]`, together with values corresponding to `t*` on the value stack.
+The `fiber.mount_new` and `fiber.switch_new` instructions create a new fiber and immediately enter it.
 
-The `fiber.spawn` instruction is analogous to a `call` instruction, the effect of the instruction is to leave on the value stack the return values of the fiber's function. However, as with other fibers, the new fiber may suspend; in which case there should be appropriate `event` blocks in the instruction stream enclosing the `fiber.spawn` instruction.
+The first has the form `fiber.mount_new $return_event $fiber_func ($on_event $handle_label)* : [ti*] -> [fiberref to*]`.
+It creates a new fiber and immediately mounts it, executing `$fiber_func` on the fiber with the given `ti*` values as arguments.
+If the current fiber is resumed with `$return_event` (say because `$fiber_func` returns), control is transferred to the instruction following `fiber.spawn` with the returned values (along with a reference to the fiber that was allocated); all other events are processed according to the given event-handler table (except each label has an additional first `fiberref` parameter providing the reference to the fiber that was allocated).
+`fiber.switch_new` is similar but also takes a `funcref` to switch from.
 
-Notice that only the newly created fiber has access to the reference that identifies the new fiber. If it is desired that the parent has access to this the code generator would typically insert a `fiber.suspend` instruction at the start of the function and pass out the `fiber` in an appropriate event description.
+While it is easy to imitate these operations with `fiber.new` and `fiber.mount`/`fiber.switch`, applications are encouraged to use these operations when it is likely that the given fiber will return without switching to another fiber or dismounting.
+Engines might support optimistically executing `$fiber_func` on the *current* fiber, only allocating a new fiber and moving stack frames to it if/when an actual switch/dismount first occurs.
 
-#### `fiber.retire` Retire a fiber
+#### `fiber.dismount_release`/`fiber.switch_release` Leaving and releasing a fiber
 
-The `fiber.retire` instruction is used when a fiber has finished its work and wishes to inform its parent of any final results. Like `fiber.suspend` (and `fiber.resume`), `fiber.retire` has an event argument&mdash;together with associated values on the argument stack&mdash; that are communicated.
+The `fiber.dismount_release` and `fiber.switch_release` instructions are used when a fiber has finished its work and wishes to inform another fiber of its final results without necessarily returning from its root function.
+It has the obvious form and semantics.
 
-In addition, the retiring fiber is put into a moribund state and any computation resources associated with it are released. If the fiber has any active descendants then they too are made moribund.
-
->It is not recommended that a fiber allows exceptions to be propagated out of the fiber function. Instead, the function should use a `fiber.retire` &mdash;together with an appropriate event description&mdash;to signal the exceptional return. This allows the resume ancestor to directly capture the exceptional event as part of its normal response to the resume.
-
->The reason that we don't recommend allowing exceptions to propagate is that an inappropriate exception handler may be invoked as a result. This is especially dangerous in the case that the retiring fiber was switched to&mdash;with a `fiber.switch` instruction&mdash;rather than being resumed.
-
-#### `fiber.retireto` Retire a fiber and directly switch
-
-The `fiber.retireto` instruction is used when a fiber has finished its work and wishes to switch to another fiber. This is analogous to tail recursive calls of functions: the current fiber is retiring and another fiber is resumed.
-
-The `fiber.retireto` instruction has three operands: the identity of the fiber being retired, the identity of the fiber being resumed and an event &mdash;together with associated values on the argument stack&mdash;to communicate to the newly resumed fiber.
-
-In addition, the retiring fiber is put into a moribund state and any computation resources associated with it are released.
+Besides being a convenience, these instructions combine well with `fiber.mount_new` and `fiber.switch_new`.
+In particular, if the current fiber was the newly allocated fiber and its frames are still on the fiber that allocated it, those frames can be released without being moved.
 
 ## Examples
 
