@@ -200,6 +200,8 @@ Note that it does not trigger any unwinding of the given fiber, as that would re
 
 ## Utility Instructions
 
+The following can be expressed using the above instructions but help with some common cases while also providing optimization opportunities that would be hard to identify if broken down into multiple above instructions.
+
 #### `fiber.mount_new`/`fiber.switch_new` Create and execute a new fiber
 
 The `fiber.mount_new` and `fiber.switch_new` instructions create a new fiber and immediately enter it.
