@@ -228,144 +228,179 @@ We look at three examples in order of increasing complexity and sophistication: 
 
 ### Yield-style generators
 
-The so-called yield style generator pattern consists of a pair: a generator function that generates elements and a consumer that consumes those elements. When the generator has found the next element it yields it to the consumer, and when the consumer needs the next element it waits for it. Yield-style generators represents the simplest use case for stack switching in general; which is why we lead with it here.
+The so-called yield-style generator pattern consists of a pair: a generator function that generates elements and a consumer that consumes those elements. When the generator has found the next element it yields it to the consumer, and when the consumer needs the next element it waits for it. Yield-style generators represent the simplest use case for stack-switching in general; which is why we lead with it here.
 
-#### Generating elements of an array
-We start with a simple C-style pseudo-code example of a generator that yields for every element of an array. For explanatory purposes, we introduce a new `generator` function type and a new ``yield` statement to C:
+#### Generating elements
+
+In Kotlin, one can write
+
 ```
-void generator arrayGenerator(fiber *thisTask,int count,int els){
-  for(int ix=0;ix<count;ix++){
-    thisTask yield els[ix];
+val fibonacci: Sequence<Int> = sequence {
+  var i: Int = 0
+  var j: Int = 1
+  while (true) {
+    yield(i)
+    val k: Int = i+j
+    i = j
+    j = k
   }
 }
 ```
-The statement:
-```
-thisTask yield els[ix]
-```
-is hypothetical code that a generator might execute to yield a value from a generator.
 
-In WebAssembly, this generator can be written:
-```
-(type $generator (ref fiber i32))
-(tag $identify (param ref $generator))
-(tag $yield (param i32))
-(tag $next)
-(tag $end-gen)
+Every time you call `fibonacci.iterator()`, Kotlin allocates a new stack that will execute through the above loop each time you call `next()` on the iterator, pausing and providing a value once it hits a `yield` operation.
+Due to JVM limitations, Kotlin already supports its coroutines via state-machine conversion, but the team has expressed significant interest in using fibers should they be made available in WebAssembly.
 
-(func $arrayGenerator (param $thisTask $generator) (param $count i32) (param $els i32)
-  (handle $on-init
-    (fiber.suspend (local.get $thisTask) $identify (local.get $thisTask))
-    (event $next)  ;; we are just waiting for the first next event
+While Kotlin's runtime provides a great deal of infrastructure enabling users to have significant control over how coroutines are executed and scheduled, here we will boil this down to two key pieces of information that the runtime provides: what stack the generator is running on, and who should it switch to when it yields the next value (which can vary each time it yields).
+In WebAssembly, supposing for simplicity that this information is given explicitly as arguments, this generator can be written as:
+
+```
+(func $boxInt (param i32) (result $kotlinObject))
+
+(tag $next (param fiberref)) ;; the fiber to yield the next value to
+(tag $end-gen) ;; not used by this (infinite) generator, but used generally
+(tag $yieldInt (param i32))
+(tag $yieldObject (param $kotlinObject))
+(tag $returnedUnreachable)
+
+(func $fibonacciIterator (param $thisFiber fiberref) (result fiberref)
+  (return (fiber.new $returnedUnreachable $next $fibonacciGenerator)
+)
+
+(func $fibonacciGenerator (param $thisFiber fiberref) (param $otherFiber fiberref)
+                          (local $i i32) (local $j i32) (local $k i32)
+  (local.set $i (i32.const 0))
+  (local.set $j (i32.const 1))
+  (loop $loop ;; label type is []
+    (block $handle_next ;; label type is [fiberref]
+      (fiber.switch $yieldInt $next $handle_next (local.get $i) (local.get $thisFiber) (local.get $otherFiber))
+      (fiber.switch $yieldObject $next $handle_next (call $boxInt (local.get $i)) (local.get $thisFiber) (local.get $otherFiber))
+      unreachable
+    ) ;; $handle_next : [fiberref]
+    (local.set $otherFiber)
+    (local.set $k (i32.add (local.get $i) (local.get $j)))
+    (local.set $i (local.get $j))
+    (local.set $j (local.get $k))
+    (br $loop)
   )
-
-  (local $ix i32)
-  (local.set $ix (i32.const 0))
-  (loop $l
-    (local.get $ix)
-    (local.get $count)
-    (br_if $l (i32.ge (local.get $ix) (local.get $count)))
-
-    (handle
-      (fiber.suspend (local.get $thisTask)
-          $yield 
-          (i32.load (i32.add (local.get $els) 
-                             (i32.mul (local.get $ix)
-                                      (i32.const 4))))))
-      (event $on-next ;; set up for the next $next event
-        (local.set $ix (i32.add (local.get $ix) (i32.const 1)))
-        (br $l)
-      )
-    ) ;; handle
-  ) ;; $l
-  ;; nothing to return
-  (return)
+  ;; unreachable
 )
 ```
-When a fiber suspends, it must be in a `handle` context where one or more `event` handlers are available to it. In this case our generator has two such `handle` blocks; the first is used during the generator's initialization phase and the second during the main loop.
 
-Our generator will be created in a running state&mdash;using the `fiber.spawn` instruction. This means that one of the generator function's first responsibilities is to communicate its identity to the caller. This is achieved through the fragment:
-```
-(handle $on-init
-  (fiber.suspend (local.get $thisTask) $identify (local.get $thisTask))
-  (event $next)  ;; we are just waiting for the first next event
-)
-```
-The `$arrayGenerator` suspends itself, issuing an `identify` event that the caller will respond to. The generator function will continue execution only when the caller issues a `$next` event to it. Suspending with the `$identify` event allows the caller to record the identity of the generator's fiber.
+The function `$fibonacciIterator` provides the (simplified) implementation of `fibonacci.iterator()`.
+(More precisely, it provides the code for allocating the fiber used by that iterator.)
+The return tag is `$returnedUnreachable`, which is not expected to be used because the generator will never return but rather will always switch and possibly release itself.
+(This pattern will be common, so it might be useful to make this tag optional, trapping if the function returns.)
+The only handled tag is `$next`.
+When resumed with that event, the specified function `$fibonacciGenerator` will be called with the reference to the fiber that was created as its first argument and with the payload of `$next` (the fiber to yield the next value to) as its second argument.
 
-During normal execution, the `$arrayGenerator` is always waiting for an `$next` event to trigger the computation of the next element in the generated sequence. If a different event were signaled to the generator the engine would simply trap.
+That function will then enter an (infinite) loop and immediately switch to the given `$otherFiber`.
+It will first attempt to yield an *unboxed* integer using `$yieldInt`.
+However, the other fiber might have been written generically, so if that attempt fails it will then box the integer and yield the resulting object using `$yieldObject`.
+This latter switch is guaranteed to be handled, so the following is `unreachable`.
 
-Notice that the array generator has definite knowledge of its own fiber&mdash;it is given the identity of its fiber explictly. This is needed because when a fiber suspends, it must use the identity of the fiber that is suspending. There is no implicit searching for which computation to suspend.
-
-The end of the `$arrayGenerator`&mdash;which is triggered when there are no more elements to generate&mdash;is marked by a simple `return`. This will terminate the fiber and also signal to the consumer that generation has finished.
+In either case, the fiber is left in a suspended state such that it branch to `$handle_next` once yielded to with a `$next` event.
+The payload of that event will be the fiber that is now waiting for the next fiber.
+(This can change because the iterator can be arbitrarily passed around the program between yields, including to a different coroutine.)
+So `$otherFiber` is updated to that fiber, the integers `$i` and `$j` are updated, and the loop wraps around, yielding once again.
 
 #### Consuming generated elements
-The consumer side of the generator/consumer scenario is similar to the generator; with a few key differences:
 
-* The consumer drives the overall choreography
-* The generator does not have a specific reference to the consumer; but the consumer knows and manages the generator. 
+The consumer side of the generator/consumer scenario is similar to the generator; the events are simply swapped.
 
-As before, we start with a C-style psuedo code that uses a generator to add up all the elements generated:
+As a simple example, consider the following Kotlin code:
+
 ```
-int addAllElements(int count, int els[]){
-  fiber *generator = arrayGenerator(count,els);
-  int total = 0;
-  while(true){
-    switch(generator resume next){
-      case yield(El):
-        total += El;
-        continue;
-      case end:
-        return total;
-    }
-  }
+fun sumFirstThreeFibonacci(): Int {
+  val iterator: Iterator<Int> = fibonacci.iterator()
+  var sum: Int = 0
+  sum += iterator.next()
+  sum += iterator.next()
+  sum += iterator.next()
+  return sum
 }
 ```
->The expression `generator resume next` is new syntax to resume a fiber with an
->identified event (in this case `next`); the value returned by the expression is
->the event signaled by the resumed fiber when it suspends.
 
-In WebAssembly, the `addAllElements` function takes the form:
+Once again greatly simplifying the infrastructure Kotlin provides, we can implement this in WebAssembly as follows:
+
 ```
-(func $addAllElements (param $count i32) (param $els i32) (result i32)
-  (local $generator $generator)
-  (handle
-    (fiber.spawn $arrayGenerator (local.get $count) (local.get $els))
-    (trap) ;; do not expect generator to return yet 
-    (event $identify (param ref $generator)
-      (local.set $generator)
-    )
-  )
+(func $unboxInt (param $kotlinObject) (result i32))
+(func $throwNewNoSuchElementException)
 
-  (local $total i32)
-  (local.set $total i32.const 0)
-  (loop $l
-    (handle $body
-      (fiber.resume (local.get $generator) $next ())
-      ;; The generator returned, exit $body, $lp
-      (event $yield (param i32)
-        (local.get $total) ;; next entry to add is already on the stack
-        (i32.add)
-        (local.set $total)
-        (br $l)
-      )
-      (event $end ;; not used in this example
-        (br $body)
-      )
-    )
-  )
-  (local.get $total)
-  (return)
+(func $sumFirstThreeFibonacci (param $thisFiber fiberref (result i32)
+                              (local $iterator fiberref) (local $sum i32) (local $element i32)
+  (local.set $iterator (call $fibonacciIterator (local.get $thisFiber)))
+  (local.set $sum (i32.const 0))
+  ;; first
+  (block $handle_yieldInt ;; has type [i32]
+    (block $handle_yieldObject ;; has type [$kotlinObject]
+      (block $handle_end-gen ;; has type []
+        (fiber.switch $next $yieldInt $handle_yieldInt (local.get $thisFiber) (local.get $thisFiber) (local.get $iterator))
+        unreachable
+      ) ;; $handle_end-gen : []
+      (call $throwNewNoSuchElementException)
+      unreachable
+    ) ;; $handle_yieldObject : [$kotlinObject]
+    (call $unboxInt) ;; leaves an i32 on the stack
+  ) ;; $handle_yieldInt : [i32]
+  (local.set $element)
+  (local.set $sum (i32.add (local.get $sum) (local.get $element)))
+  ;; second (syntactically identical to first)
+  (block $handle_yieldInt ;; has type [i32]
+    (block $handle_yieldObject ;; has type [$kotlinObject]
+      (block $handle_end-gen ;; has type []
+        (fiber.switch $next $yieldInt $handle_yieldInt (local.get $thisFiber) (local.get $thisFiber) (local.get $iterator))
+        unreachable
+      ) ;; $handle_end-gen : []
+      (call $throwNewNoSuchElementException)
+      unreachable
+    ) ;; $handle_yieldObject : [$kotlinObject]
+    (call $unboxInt) ;; leaves an i32 on the stack
+  ) ;; $handle_yieldInt : [i32]
+  (local.set $element)
+  (local.set $sum (i32.add (local.get $sum) (local.get $element)))
+  ;; third (syntactically identical to first and second)
+  (block $handle_yieldInt ;; has type [i32]
+    (block $handle_yieldObject ;; has type [$kotlinObject]
+      (block $handle_end-gen ;; has type []
+        (fiber.switch $next $yieldInt $handle_yieldInt (local.get $thisFiber) (local.get $thisFiber) (local.get $iterator))
+        unreachable
+      ) ;; $handle_end-gen : []
+      (call $throwNewNoSuchElementException)
+      unreachable
+    ) ;; $handle_yieldObject : [$kotlinObject]
+    (call $unboxInt) ;; leaves an i32 on the stack
+  ) ;; $handle_yieldInt : [i32]
+  (local.set $element)
+  (local.set $sum (i32.add (local.get $sum) (local.get $element)))
+  ;; done
+  (return (local.get $sum))
 )
 ```
-The first task of `$addAllElements` is to establish a new fiber to handle the generation of elements of the array. We start the generator running, which impies that we first of all need to wait for it to report back its identity. `fiber.spawn` is like `fiber.resume`, in that if the function returns, the next instruction will execute normally. However, we don't expect the generator to return yet, so we will trap if that occurs.
 
-The main structure of the consumer takes the form of an unbounded loop, with a forced termination when the generator signals that there are no further elements to generate. This can happen in two ways: the generator function can simply return, or it can (typically) `fiber.retire` with an `$end` event. Our actual generator returns, but our consumer code can accomodate either approach.
+The first task of `$sumFirstThreeFibonacci` is to establish a new fiber to handle the generation of fibonacci values, simply calling `$fibonacciIterator` defined earlier.
+After that, the body is rather repetitive.
+Although WebAssembly's representation of local control flow permits us to simply copy paste the same code each time, in reality that gets lowered to a control-flow graph and each of the three uses of `fiber.switch` references different labels within that control-flow graph.
+In each case, the handler either throws an exception (if there were no more elements to yield), or unboxes an integer and continues, or simply continues with the given integer.
+The difference is simply where in the control-flow graph they continue to.
 
->In practice, the style of generators and consumers is dictated by the toolchain. It would have been possible to structure our generator differently. For example, if generators were created as suspended fibers&mdash;using `fiber.new` instructions&mdash;then the initial code of our generator would not have suspended using the `$identify` event. However, in that case, the top-level of the generator function should consist of an `event` block: corresponding to the first `$next` event the generator receives.
->In any case, generator functions enjoy a somewhat special relationship with their callers and their structure reflects that.
+#### Variations
 
-Again, as with the generator, if an event is signaled to the consumer that does not match either event tag, the engine will trap.
+In practice, the style of generators and consumers is dictated by the toolchain.
+It would have been possible to structure this particular code differently.
+For example, in this case we assumed the Kotlin runtime always has all Kotlin code running on a fiber, which lets us simply `fiber.switch` symmetrically back and forth between the generator and the consumer.
+While this architecture tends to scale better to more complicated programs and features, in this case we could have instead had the consumer `fiber.mount` the generator each time and had the generator `fiber.dismount` up to the consumer each time.
+This would eliminate the need for `$next` to specify the `fiberref` to yield the value to.
+
+While that elimination might seem like a useful simplification, it actually obstructs valuable optimizations, nor is it reflective of how Kotlin uses continuations.
+In particular, continuations in Kotlin (and many languages) are not necessarily fibers.
+One example where this distinction is usefu is when the generator is used in a `for` loop, i.e. `for (element in fibonacci) {...}`.
+With `for` loops, it is possible to run the generator without ever allocating the fiber.
+Every time the generator above yielded a value, it can instead "call" the body of the `for` loop with the yielded element.
+To support this generality and optimization, a runtime generally has `$fibonacciGenerator` use `$receiverFunction` instead of `$otherFiber`, which it calls each time with the value to yield.
+(This is in fact roughly what Kotlin does.)
+That `$receiverFunction` could then be the body of a `for` loop, or it could be code that switches to another fiber.
+
+When adapting toy code into a real-world code, many simplifications that work for the toy code turn out to be insufficiently expressive for the real-world code.
 
 ### Cooperative Coroutines
 
