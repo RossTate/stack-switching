@@ -166,7 +166,7 @@ In WebAssembly, supposing for simplicity that this information is given explicit
 (type $FiberIterator (struct (sub $iterator)
                              ($hasNext    ([(ref $Iterator)] -> [i32]))
                              ($next       ([(ref $Iterator)] -> [(ref $KotlinObject)]))
-                             ($generate   ([jumpref] -> unreachable))
+                             ($generate   ([(ref $FiberIterator) jumpref] -> unreachable))
                              ($finished   i32)
                              ($got_next   i32)
                              ($saved_next (ref null $KotlinObject))
@@ -278,7 +278,8 @@ The above intermediary function is called when the generating fiber is first cre
 It simply looks up the `$generate` function the `FiberIterator` was allocated with and tail calls it.
 
 ```
-(func $fibonacci_generate (param $consume_next jumpref)
+(func $fibonacci_generate (param $self (ref $FiberIterator))
+                          (param $consume_next jumpref)
                           (local $i i32) (local $j i32) (local $k i32)
   (local.set $i (i32.const 0))
   (local.set $j (i32.const 1))
@@ -301,6 +302,7 @@ It simply looks up the `$generate` function the `FiberIterator` was allocated wi
 In the case of `fibonacci`, that function is `$fibonacci_generate`, given above.
 Note that every use of `yield` in the `fibonacci` generator has been implemented with a `jump.call_with_new $FiberIterator_yield`, providing the label of the control point immediately after the yield.
 This control point then updates the `jumpref` to yield control to and proceeds to generate more values.
+(In this case, `$fibonacci_generate` makes no use of `$self` because the surface-level generator code does not close over any free variables, but if it did then they would be additional fields within a subclass of `$FiberIterator`.)
 
 ```
 (func $FiberIterator_yield (param $consume_next jumpref)
